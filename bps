@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional
+
+
+DEFAULT_BIRDC_CANDIDATES = []
+if os.environ.get('BIRDC'):
+    DEFAULT_BIRDC_CANDIDATES.append(os.environ['BIRDC'])
+DEFAULT_BIRDC_CANDIDATES.extend(['birdc', '/usr/sbin/birdc', '/usr/local/sbin/birdc'])
+
+SUMMARY_RE = re.compile(
+    r'^(?P<name>\S+)\s+'
+    r'(?P<proto>BGP|Static|Kernel|Device|Direct|RPKI|BFD|Pipe|OSPF|RAdv|Babel|RIP|Perf|Aggregator)\s+'
+    r'(?P<table>\S+)\s+'
+    r'(?P<state>\S+)\s+'
+    r'(?P<since>(?:\d{4}-\d{2}-\d{2}(?:\s+\d{2}:\d{2}:\d{2})?)|(?:\d{2}:\d{2}:\d{2}(?:\.\d+)?))'
+    r'(?:\s+(?P<info>.*))?$'
+)
+
+STATE_ORDER = {
+    'established': 0,
+    'up': 0,
+    'connect': 1,
+    'active': 2,
+    'idle': 3,
+    'start': 4,
+}
+
+COLORS = {
+    'reset': '\033[0m',
+    'bold': '\033[1m',
+    'dim': '\033[2m',
+    'red': '\033[31m',
+    'green': '\033[32m',
+    'yellow': '\033[33m',
+    'blue': '\033[34m',
+    'magenta': '\033[35m',
+    'cyan': '\033[36m',
+    'gray': '\033[90m',
+}
+
+
+def resolve_birdc() -> str:
+    for candidate in DEFAULT_BIRDC_CANDIDATES:
+        if not candidate:
+            continue
+        if os.path.isabs(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    sys.stderr.write('Could not find birdc. Set BIRDC=/path/to/birdc if it is installed somewhere unusual.\n')
+    sys.exit(127)
+
+
+BIRDC = resolve_birdc()
+
+
+def run(cmd: List[str]) -> str:
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.stderr.write(p.stderr or p.stdout)
+        sys.exit(p.returncode)
+    return p.stdout
+
+
+def strip_banner(text: str) -> str:
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        if line.startswith('BIRD ') and 'ready.' in line:
+            continue
+        if line.strip() == 'Access restricted':
+            continue
+        out.append(line)
+    return '\n'.join(out).strip('\n')
+
+
+def human_name(name: str) -> str:
+    s = name
+    s = re.sub(r'_AS(\d+)_v([46])$', r' AS\1 v\2', s)
+    s = re.sub(r'_AS(\d+)$', r' AS\1', s)
+    s = s.replace('_', ' ')
+    return s
+
+
+def colorize(text: str, color: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"{COLORS[color]}{text}{COLORS['reset']}"
+
+
+def status_label(state: str) -> str:
+    s = (state or '').lower()
+    if s == 'established':
+        return 'UP'
+    if s:
+        return s.upper()
+    return '-'
+
+
+def status_style(state: str, enabled: bool, width: Optional[int] = None) -> str:
+    label = status_label(state)
+    padded = f"{label:<{width}}" if width else label
+    s = (state or '').lower()
+    if s == 'established':
+        return colorize(padded, 'green', enabled)
+    if s in ('connect', 'active'):
+        return colorize(padded, 'yellow', enabled)
+    if s in ('idle', 'down', 'start'):
+        return colorize(padded, 'red', enabled)
+    return colorize(padded, 'cyan', enabled)
+
+
+def parse_summary() -> Dict[str, Dict[str, str]]:
+    text = strip_banner(run([BIRDC, 'show', 'protocols']))
+    items: Dict[str, Dict[str, str]] = {}
+    lines = text.splitlines()
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        m = SUMMARY_RE.match(line.rstrip())
+        if not m:
+            continue
+        row = m.groupdict(default='')
+        if row['proto'] != 'BGP':
+            continue
+        items[row['name']] = row
+    return items
+
+
+def parse_protocol(name: str) -> Dict[str, str]:
+    text = strip_banner(run([BIRDC, '-r', 'show', 'protocols', 'all', name]))
+    data = {
+        'description': '',
+        'bgp_state': '',
+        'neighbor': '',
+        'neighbor_as': '',
+        'source': '',
+        'last_error': '',
+        'connect_delay': '',
+        'imported': '0',
+        'exported': '0',
+        'preferred': '0',
+        'channels': '',
+    }
+
+    channels = []
+    imported_total = 0
+    exported_total = 0
+    preferred_total = 0
+    current_channel = None
+
+    for raw in text.splitlines():
+        s = raw.strip()
+
+        m = re.match(r'Description:\s+(.*)', s)
+        if m:
+            data['description'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'BGP state:\s+(.*)', s)
+        if m:
+            data['bgp_state'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'Neighbor address:\s+(.*)', s)
+        if m:
+            data['neighbor'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'Neighbor AS:\s+(.*)', s)
+        if m:
+            data['neighbor_as'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'Source address:\s+(.*)', s)
+        if m:
+            data['source'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'Last error:\s+(.*)', s)
+        if m:
+            data['last_error'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'Connect delay:\s+(.*)', s)
+        if m:
+            data['connect_delay'] = m.group(1).strip()
+            continue
+
+        m = re.match(r'Channel\s+(\S+)', s)
+        if m:
+            current_channel = m.group(1)
+            channels.append(current_channel)
+            continue
+
+        m = re.match(r'Routes:\s+(.*)', s)
+        if m and current_channel:
+            body = m.group(1)
+            mi = re.search(r'(\d+)\s+imported', body)
+            me = re.search(r'(\d+)\s+exported', body)
+            mp = re.search(r'(\d+)\s+preferred', body)
+            if mi:
+                imported_total += int(mi.group(1))
+            if me:
+                exported_total += int(me.group(1))
+            if mp:
+                preferred_total += int(mp.group(1))
+            continue
+
+    data['imported'] = str(imported_total)
+    data['exported'] = str(exported_total)
+    data['preferred'] = str(preferred_total)
+    data['channels'] = ','.join(channels)
+    return data
+
+
+def summarize_detail(r: Dict[str, str]) -> str:
+    parts = []
+    desc = (r.get('description') or '').strip()
+    if desc:
+        parts.append(desc)
+
+    state = (r.get('bgp_state') or '').lower()
+    err = (r.get('last_error') or '').strip()
+    delay = (r.get('connect_delay') or '').strip()
+
+    if state == 'established':
+        parts.append(f"src {r.get('source', '?')}")
+    else:
+        if err:
+            parts.append(err)
+        if delay:
+            parts.append(f"retry {delay}")
+
+    if not parts and r.get('info'):
+        parts.append(r['info'])
+
+    deduped = []
+    seen = set()
+    for p in parts:
+        if p not in seen:
+            deduped.append(p)
+            seen.add(p)
+    return ' | '.join(deduped)
+
+
+def collect_rows(needle: Optional[str], only_up: bool) -> List[Dict[str, str]]:
+    summary = parse_summary()
+    rows = []
+    for name, item in summary.items():
+        pretty = human_name(name)
+        if needle and needle not in name.lower() and needle not in pretty.lower():
+            continue
+        row = {**item, **parse_protocol(name)}
+        row['pretty_name'] = pretty
+        row['detail'] = summarize_detail(row)
+        state = (row.get('bgp_state') or row.get('info') or row.get('state') or '').lower()
+        if only_up and state != 'established':
+            continue
+        rows.append(row)
+
+    rows.sort(key=lambda r: (STATE_ORDER.get((r.get('bgp_state') or '').lower(), 99), r['name']))
+    return rows
+
+
+def fit(text: str, width: int) -> str:
+    if width <= 0:
+        return ''
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return text[:width]
+    return text[: width - 1] + '…'
+
+
+def render_rows(rows: List[Dict[str, str]], color: bool, compact: bool) -> str:
+    term_width = shutil.get_terminal_size((180, 40)).columns
+    if compact or term_width < 150:
+        headers = ['NAME', 'PEER', 'STATE', 'IN', 'OUT', 'DETAIL']
+        raw = []
+        for r in rows:
+            state_plain = status_label(r.get('bgp_state') or r.get('state') or '')
+            raw.append([
+                r['pretty_name'],
+                f"{r['neighbor']} AS{r['neighbor_as']}" if r.get('neighbor_as') else r.get('neighbor', ''),
+                state_plain,
+                r.get('imported', '0'),
+                r.get('exported', '0'),
+                r.get('detail', ''),
+                r.get('bgp_state') or r.get('state') or '',
+            ])
+        widths = [
+            min(max(len(headers[0]), *(len(row[0]) for row in raw)) if raw else len(headers[0]), 30),
+            min(max(len(headers[1]), *(len(row[1]) for row in raw)) if raw else len(headers[1]), 34),
+            max(len(headers[2]), *(len(row[2]) for row in raw)) if raw else len(headers[2]),
+            max(len(headers[3]), *(len(row[3]) for row in raw)) if raw else len(headers[3]),
+            max(len(headers[4]), *(len(row[4]) for row in raw)) if raw else len(headers[4]),
+        ]
+        fixed = sum(widths) + 2 * (len(headers) - 1)
+        detail_width = max(30, term_width - fixed - 2)
+        lines = []
+        lines.append(
+            f"{headers[0]:<{widths[0]}}  {headers[1]:<{widths[1]}}  {headers[2]:<{widths[2]}}  {headers[3]:>{widths[3]}}  {headers[4]:>{widths[4]}}  {headers[5]}"
+        )
+        lines.append(
+            f"{'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  {'-' * min(detail_width, len(headers[5]))}"
+        )
+        for row in raw:
+            state_col = status_style(row[6], color, widths[2])
+            lines.append(
+                f"{fit(row[0], widths[0]):<{widths[0]}}  {fit(row[1], widths[1]):<{widths[1]}}  {state_col}  {row[3]:>{widths[3]}}  {row[4]:>{widths[4]}}  {fit(row[5], detail_width)}"
+            )
+        return '\n'.join(lines)
+
+    headers = ['NAME', 'NEIGHBOR', 'AF', 'STATE', 'IMPORTED', 'EXPORTED', 'SINCE', 'DETAIL']
+    raw = []
+    for r in rows:
+        state_plain = status_label(r.get('bgp_state') or r.get('state') or '')
+        raw.append([
+            r['pretty_name'],
+            f"{r['neighbor']} (AS{r['neighbor_as']})" if r.get('neighbor_as') else r.get('neighbor', ''),
+            r.get('channels') or '-',
+            state_plain,
+            r.get('imported', '0'),
+            r.get('exported', '0'),
+            r.get('since', ''),
+            r.get('detail', ''),
+            r.get('bgp_state') or r.get('state') or '',
+        ])
+    widths = [
+        min(max(len(headers[0]), *(len(row[0]) for row in raw)) if raw else len(headers[0]), 30),
+        min(max(len(headers[1]), *(len(row[1]) for row in raw)) if raw else len(headers[1]), 44),
+        min(max(len(headers[2]), *(len(row[2]) for row in raw)) if raw else len(headers[2]), 10),
+        max(len(headers[3]), *(len(row[3]) for row in raw)) if raw else len(headers[3]),
+        max(len(headers[4]), *(len(row[4]) for row in raw)) if raw else len(headers[4]),
+        max(len(headers[5]), *(len(row[5]) for row in raw)) if raw else len(headers[5]),
+        len(headers[6]),
+    ]
+    fixed = sum(widths) + 2 * (len(headers) - 1)
+    detail_width = max(40, term_width - fixed - 2)
+    lines = []
+    lines.append(
+        f"{headers[0]:<{widths[0]}}  {headers[1]:<{widths[1]}}  {headers[2]:<{widths[2]}}  {headers[3]:<{widths[3]}}  {headers[4]:>{widths[4]}}  {headers[5]:>{widths[5]}}  {headers[6]}  {headers[7]}"
+    )
+    lines.append(
+        f"{'-' * widths[0]}  {'-' * widths[1]}  {'-' * widths[2]}  {'-' * widths[3]}  {'-' * widths[4]}  {'-' * widths[5]}  {'-' * widths[6]}  {'-' * min(detail_width, len(headers[7]))}"
+    )
+    for row in raw:
+        state_col = status_style(row[8], color, widths[3])
+        lines.append(
+            f"{fit(row[0], widths[0]):<{widths[0]}}  {fit(row[1], widths[1]):<{widths[1]}}  {fit(row[2], widths[2]):<{widths[2]}}  {state_col}  {row[4]:>{widths[4]}}  {row[5]:>{widths[5]}}  {row[6]}  {fit(row[7], detail_width)}"
+        )
+    return '\n'.join(lines)
+
+
+def render(rows: List[Dict[str, str]], color: bool, compact: bool, watch: Optional[int]) -> str:
+    up = sum(1 for r in rows if (r.get('bgp_state') or '').lower() == 'established')
+    down = len(rows) - up
+    stamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    header = f"BGP peer summary | total {len(rows)} | up {up} | down {down} | generated {stamp}"
+    if watch:
+        header += f" | watch {watch}s"
+    body = render_rows(rows, color=color, compact=compact)
+    tip = 'Flags: --up | --match <text> | --watch <sec> | --compact | --no-color'
+    return f"{header}\n\n{body}\n\n{tip}"
+
+
+def parse_args() -> Dict[str, object]:
+    only_up = '--up' in sys.argv
+    compact = '--compact' in sys.argv
+    no_color = '--no-color' in sys.argv
+    watch = None
+    needle = None
+
+    if '--match' in sys.argv:
+        try:
+            needle = sys.argv[sys.argv.index('--match') + 1].lower()
+        except IndexError:
+            sys.stderr.write('--match requires a value\n')
+            sys.exit(2)
+
+    if '--watch' in sys.argv:
+        try:
+            watch = int(sys.argv[sys.argv.index('--watch') + 1])
+        except (IndexError, ValueError):
+            sys.stderr.write('--watch requires an integer number of seconds\n')
+            sys.exit(2)
+        if watch < 1:
+            sys.stderr.write('--watch must be >= 1\n')
+            sys.exit(2)
+
+    color = sys.stdout.isatty() and not no_color and os.environ.get('NO_COLOR') is None
+    return {
+        'only_up': only_up,
+        'compact': compact,
+        'color': color,
+        'watch': watch,
+        'needle': needle,
+    }
+
+
+def main() -> int:
+    args = parse_args()
+    if args['watch']:
+        try:
+            while True:
+                rows = collect_rows(args['needle'], args['only_up'])
+                print('\033[H\033[J', end='')
+                if rows:
+                    print(render(rows, color=args['color'], compact=args['compact'], watch=args['watch']))
+                else:
+                    print('No matching BGP peers found.')
+                time.sleep(args['watch'])
+        except KeyboardInterrupt:
+            return 0
+
+    rows = collect_rows(args['needle'], args['only_up'])
+    if not rows:
+        print('No matching BGP peers found.')
+        return 0
+    print(render(rows, color=args['color'], compact=args['compact'], watch=None))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
