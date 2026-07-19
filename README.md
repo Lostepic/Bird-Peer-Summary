@@ -45,7 +45,7 @@ BIRDC=/usr/local/sbin/birdc ./bps
 Clone the repo and run the installer:
 
 ```bash
-git clone git@github.com:Lostepic/Bird-Peer-Summary.git
+git clone https://github.com/Lostepic/Bird-Peer-Summary.git
 cd Bird-Peer-Summary
 chmod +x install.sh
 sudo ./install.sh
