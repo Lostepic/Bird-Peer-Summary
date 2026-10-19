@@ -1,0 +1,30 @@
+BIRD 2.18.1 ready.
+Name       Proto      Table      State  Since         Info
+device1    Device     ---        up     2026-10-01
+  Description: Device discovery
+upstream_v4 BGP        ---        up     2026-10-18 12:30:00  Established
+  Description: Example transit
+  BGP state:          Established
+    Neighbor address: 192.0.2.1
+    Neighbor AS:      64501
+    Source address:   192.0.2.2
+  Channel ipv4
+    State: UP
+    Routes: 1000000 imported, 2 exported, 900000 preferred
+  Channel ipv6
+    State: UP
+    Routes: 200000 imported, 3 exported, 100000 preferred
+ix_v6      BGP        ---        start  14:03:02.123  Active Socket: Connection refused
+  Description: Example exchange
+  BGP state:          Active
+    Neighbor address: 2001:db8::1
+    Neighbor AS:      64502
+    Last error:       Socket: Connection refused
+    Connect delay:    4.500/5
+  Channel ipv6
+    State: DOWN
+disabled   BGP        ---        down   2026-10-17 09:00:00  Administratively down
+  Description: Maintenance
+kernel1    Kernel     master4    up     2026-10-01
+  Channel ipv4
+    Routes: 999 imported, 999 exported, 999 preferred
